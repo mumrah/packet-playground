@@ -3,13 +3,13 @@
 Sandbox for playing with AX25 packets over various interfaces. As the code
 exists today, the data flow is:
 
-PC #1 (YAAC) -> KISS Serial -> Arduino #1 -> CC1101 -> RF
-RF -> CC1101 -> Arduino #2 -> KISS Serial -> PC #1 (Serial console)
+* PC #1 (YAAC) -> KISS Serial -> Arduino #1 -> CC1101 -> RF
+* RF -> CC1101 -> Arduino #2 -> KISS Serial -> PC #1 (Serial console)
 
 The eventual desired flow is:
 
-RPi #1 (G8BPQ) -> KISS i2c -> Arduino #1 -> CC1101 -> RF
-RF -> CC1101 -> Arduino #2 -> KISS i2c -> RPi #2 (G8BPQ)
+* RPi #1 (G8BPQ) -> KISS i2c -> Arduino #1 -> CC1101 -> RF
+* RF -> CC1101 -> Arduino #2 -> KISS i2c -> RPi #2 (G8BPQ)
 
 ## KISS Serial
 
