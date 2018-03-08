@@ -20,7 +20,7 @@ or anything capable of supporting AX25 packets encoded with KISS
 
 Using this [CC1101 library](https://github.com/veonik/arduino-cc1101/),
 we can send packets over RF to CC1101 modules. The modules interface to the
-Arduino over SPI. The packet format is very basic:
+Arduino over SPI. The RF packet format is very basic:
 
 ```
 RF_PACKET = LENGTH DATA
@@ -28,8 +28,8 @@ LENGTH    = <int>
 DATA      = <int[]>
 ```
 
-An address field is also supported by the CC1101 modules, but I haven't tried
-that yet.
+An address field is also supported by the CC1101 modules which is transmitted along
+with the packet, but I haven't tried that yet.
 
 ## KISS I2C
 
