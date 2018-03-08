@@ -349,7 +349,7 @@ void setup() {
   debug("TNC Begin");
 }
 
-//CircularBuffer<uint8_t, 20> rf_input_buffer;
+uint8_t serial_read_buffer[64];
 
 void loop() {
   // Check for incoming packet and copy it to a frame
@@ -420,12 +420,11 @@ void loop() {
     }
   } else {
     // last frame is ACK'd we're ready to send next byte
-    if(Serial.available()) {
-      uint8_t byte = Serial.read();
-      uint8_t data[1];
-      data[0] = byte;
+    uint8_t n = min(Serial.available(), 64);
+    if(n > 0) {
+      Serial.readBytes(serial_read_buffer, n);
       debug("sending one byte");
-      hdlc_new_data_frame(&outgoingFrame, data, 1);
+      hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n);
       hdlc_send_data(&outgoingFrame, &packet);
     }
   }
@@ -434,53 +433,4 @@ void loop() {
   //  Serial.print(": ");
   //  Serial.println((char)rf_input_buffer.pop());
   //}
-}
-
-void loop2() {
-  // Check incoming RF packets
-  if (packetWaiting) {
-    detachInterrupt(CC1101Interrupt);
-    packetWaiting = false;
-    CCPACKET packet;
-    if (radio.receiveData(&packet) > 0) {
-      /*
-      Serial.println(F("Received packet..."));
-      if (!packet.crc_ok) {
-        Serial.println(F("crc not ok"));
-      }
-      Serial.print(F("lqi: "));
-      Serial.println(lqi(packet.lqi));
-      Serial.print(F("rssi: "));
-      Serial.print(rssi(packet.rssi));
-      Serial.println(F("dBm"));
-      */
-      if (packet.crc_ok && packet.length > 0) {
-        //on_hdlc(&packet);
-        //Serial.print(F("packet: len "));
-        //Serial.println(packet.length);
-        //Serial.println(F("data: "));
-        //Serial.println((const char *) packet.data);
-
-        // Send this packet out over Serial with KISS framing
-        serial_kiss_wrapper(packet.data, packet.length);
-      }
-    }
-    attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
-  }
-
-  // Check i2c buffer
-  uint8_t n = i2c_input_buffer.size();
-  if(n > 0) {
-    //Serial.print("Input buffer has ");
-    //Serial.print(n);
-    //Serial.println(" bytes");
-    for(uint8_t i=0; i<n; i++) {
-      poll_kiss(i2c_input_buffer.shift(), &kissCtx);
-    }
-  }
-
-  // Read KISS framed packets from Serial
-  while(Serial.available() > 0) {
-    poll_kiss(Serial.read(), &kissCtx);
-  }
 }
