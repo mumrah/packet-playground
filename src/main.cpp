@@ -40,7 +40,7 @@ void messageReceived() {
 #define AX25_MAX_FRAME_LEN 330
 
 #define I2C_ADDRESS 0x04
-#define DEBUG false
+#define DEBUG true
 
 // types
 typedef struct KISSCtx {
@@ -52,17 +52,29 @@ typedef struct KISSCtx {
     uint8_t buffer[AX25_MAX_FRAME_LEN];
 } KISSCtx;
 
+typedef struct HDLC {
+  uint8_t address;
+  uint8_t control;
+  uint8_t data[64];
+  uint8_t data_length;
+  bool ack = true; // prevent retries of initial "null" frame
+  bool do_retry = false;
+  unsigned long time_sent = 0;
+  uint8_t send_attempts = 0;
+  bool failed = false;
+} HDLC;
+
 // util functions
 
 void debug(const char * message) {
   if(DEBUG) {
-    //Serial.println(message);
+    Serial.println(message);
   }
 }
 
 void debug(uint8_t message) {
   if(DEBUG) {
-    //Serial.println(message);
+    Serial.println(message);
   }
 }
 
@@ -88,7 +100,7 @@ int lqi(char raw) {
 CircularBuffer<uint8_t, 400> i2c_input_buffer;
 CircularBuffer<uint8_t, 100> i2c_output_buffer;
 
-
+HDLC hdlc;
 KISSCtx kissCtx;
 AX25Call dst;
 AX25Call src;
@@ -257,19 +269,123 @@ void on_i2c_write_receive(int n) {
   }
 }
 
+#define HDLC_I_FRAME 0x00
+#define HDLC_S_FRAME 0x01
+#define HDLC_U_FRAME 0x03
+
+#define HDLC_S_TYPE_RR 0x00
+#define HDLC_S_TYPE_REJ 0x01
+
+#define HDLC_POLL 0x10
+#define HDLC_FINAL 0x00
+
+uint8_t next_seq_num = 0;
+
+uint8_t get_next_seq_num() {
+  next_seq_num = (next_seq_num + 1) % 8;
+  return next_seq_num;
+}
+
+uint8_t hdlc_get_frame_type(HDLC * hdlc) {
+  if((hdlc->control & 0x03) == 0x03) {
+    return HDLC_U_FRAME;
+  } else if((hdlc->control & 0x03) == 0x01) {
+    return HDLC_S_FRAME;
+  } else {
+    return HDLC_I_FRAME;
+  }
+}
+
+uint8_t hdlc_get_s_frame_type(HDLC * hdlc) {
+  return (hdlc->control >> 2) & 0x03;
+}
+
+uint8_t hdlc_get_s_frame_recv_seq(HDLC * hdlc) {
+  return (hdlc->control >> 5) & 0x07;
+}
+
+uint8_t hdlc_get_i_frame_recv_seq(HDLC * hdlc) {
+  return (hdlc->control >> 5) & 0x07;
+}
+
+uint8_t hdlc_get_i_frame_send_seq(HDLC * hdlc) {
+  return (hdlc->control >> 1) & 0x07;
+}
+
+void hdlc_new_ack_frame(HDLC * hdlc, uint8_t seq) {
+  hdlc->address = 0xFF;
+  // RECV SEQ | P/F | TYPE | S
+  hdlc->control = ((seq << 5) & 0xE0) | HDLC_FINAL | (HDLC_S_TYPE_RR << 2) | HDLC_S_FRAME;
+  hdlc->data_length = 0;
+  hdlc->ack = false;
+  hdlc->time_sent = 0;
+  hdlc->send_attempts = 0;
+  hdlc->do_retry = false;
+}
+
+void hdlc_new_nack_frame(HDLC * hdlc, uint8_t seq) {
+  hdlc->address = 0xFF;
+  // RECV SEQ | P/F | TYPE | S
+  hdlc->control = ((seq << 5) & 0xE0) | HDLC_FINAL | (HDLC_S_TYPE_REJ << 2) | HDLC_S_FRAME;
+  hdlc->data_length = 0;
+  hdlc->ack = false;
+  hdlc->time_sent = 0;
+  hdlc->send_attempts = 0;
+  hdlc->do_retry = false;
+}
+
+void hdlc_new_data_frame(HDLC * hdlc, uint8_t data[], uint8_t length) {
+  hdlc->address = 0xFF;
+  // RECV SEQ | P/F | SEND SEQ | I
+  hdlc->control = 0x00 | HDLC_POLL | ((get_next_seq_num() << 1) & 0x0E) | HDLC_I_FRAME;
+  hdlc->data_length = length;
+  memcpy(hdlc->data, data, length);
+  hdlc->ack = false;
+  hdlc->time_sent = 0;
+  hdlc->send_attempts = 0;
+  hdlc->do_retry = false;
+}
+
+void hdlc_send(HDLC * hdlc, CCPACKET * packet) {
+  packet->data[0] = hdlc->address & 0xFF;
+  packet->data[1] = hdlc->control & 0xFF;
+  memcpy(packet->data+2, hdlc->data, hdlc->data_length);
+  packet->length = hdlc->data_length + 2;
+  detachInterrupt(CC1101Interrupt);
+  radio.sendData(*packet);
+  attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
+  hdlc->send_attempts += 1;
+  hdlc->time_sent = millis();
+  hdlc->do_retry = false;
+  hdlc->ack = false;
+}
+
+CircularBuffer<HDLC, 10> incomingPackets;
+CircularBuffer<HDLC, 10> outgoingPackets;
+
+void read_hdlc(CCPACKET * packet, HDLC * frame) {
+  frame->address = packet->data[0];
+  frame->control = packet->data[1];
+  //memcpy(frame->data, packet->data[2], packet->length - 2);
+}
+
 void setup() {
+  delay(1000);
+  Serial.begin(115200);
+  Serial.println("Start");
+
+
   radio.init();
   radio.setSyncWord(syncWord);
   radio.setCarrierFreq(CFREQ_433);
   radio.disableAddressCheck();
   radio.setTxPowerAmp(PA_LongDistance);
 
-  Wire.begin(I2C_ADDRESS);
-  Wire.onRequest(on_i2c_read_request);
-  Wire.onReceive(on_i2c_write_receive);
-  attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
+  //Wire.begin(I2C_ADDRESS);
+  //Wire.onRequest(on_i2c_read_request);
+  //Wire.onReceive(on_i2c_write_receive);
 
-  Serial.begin(9600);
+
   debug("CC1101_PARTNUM ");
   debug(radio.readReg(CC1101_PARTNUM, CC1101_STATUS_REGISTER));
   debug("CC1101_VERSION ");
@@ -279,9 +395,92 @@ void setup() {
 
   debug("CC1101 radio initialized.");
   debug("TNC Begin");
+
+  attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
 }
 
+HDLC incomingFrame;
+HDLC outgoingFrame;
+CCPACKET packet;
+
 void loop() {
+  // Check for incoming packet and copy it to a frame
+  if (packetWaiting) {
+    detachInterrupt(CC1101Interrupt);
+    packetWaiting = false;
+    bool gotPacket = false;
+    if (radio.receiveData(&packet) > 0) {
+      if (packet.crc_ok && packet.length > 0) {
+        debug("Got packet");
+        read_hdlc(&packet, &incomingFrame);
+        gotPacket = true;
+      }
+    }
+    attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
+
+    // Handle the incoming frame
+    if(gotPacket) {
+      switch(hdlc_get_frame_type(&incomingFrame)) {
+        case HDLC_I_FRAME: {
+          // incoming data frame
+          debug("Got data frame");
+          debug((char*)incomingFrame.data);
+        } break;
+        case HDLC_S_FRAME: {
+          if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_S_TYPE_RR) {
+            debug("Got ack frame");
+            outgoingFrame.ack = true;
+          } else if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_S_TYPE_REJ) {
+            debug("Got nack frame");
+            outgoingFrame.ack = false;
+            outgoingFrame.do_retry = true;
+          }
+        } break;
+        case HDLC_U_FRAME: {
+          // unsupported
+        } break;
+        default: break;
+      }
+    }
+  }
+
+  // Check if we're waiting on an ACK message
+  if(outgoingFrame.ack == false) {
+    if(millis() - outgoingFrame.time_sent > 1000) { // timeout
+      debug("ack timeout");
+      outgoingFrame.do_retry = true;
+    }
+
+
+    // Check if we need to resend last frame
+    if(outgoingFrame.do_retry == true) {
+      if(outgoingFrame.send_attempts > 3) { // too many retries
+        debug("too many retries");
+        outgoingFrame.do_retry = false;
+        outgoingFrame.failed = true;
+        outgoingFrame.ack = true;
+      } else {
+        debug("retrying");
+        hdlc_send(&outgoingFrame, &packet);
+      }
+    } else {
+      // still waiting for ACK, loop
+      delay(1);
+      return;
+    }
+  } else {
+    // last frame is ACK'd we're ready to send next byte
+    if(Serial.available()) {
+      uint8_t byte = Serial.read();
+      uint8_t data[] = {byte};
+      debug("sending one byte");
+      hdlc_new_data_frame(&outgoingFrame, data, 1);
+      hdlc_send(&outgoingFrame, &packet);
+    }
+  }
+}
+
+void loop2() {
   // Check incoming RF packets
   if (packetWaiting) {
     detachInterrupt(CC1101Interrupt);
@@ -300,6 +499,7 @@ void loop() {
       Serial.println(F("dBm"));
       */
       if (packet.crc_ok && packet.length > 0) {
+        //on_hdlc(&packet);
         //Serial.print(F("packet: len "));
         //Serial.println(packet.length);
         //Serial.println(F("data: "));
