@@ -5,6 +5,7 @@
 #include <ccpacket.h>
 
 #include "ax25.h"
+#include "HDLC.h"
 
 #define CC1101Interrupt 0 // Pin 2
 #define CC1101_GDO0 2
@@ -51,18 +52,6 @@ typedef struct KISSCtx {
     uint8_t hdlc_port = 0;
     uint8_t buffer[AX25_MAX_FRAME_LEN];
 } KISSCtx;
-
-typedef struct HDLC {
-  uint8_t address;
-  uint8_t control;
-  uint8_t data[64];
-  uint8_t data_length;
-  bool ack = true; // prevent retries of initial "null" frame
-  bool do_retry = false;
-  unsigned long time_sent = 0;
-  uint8_t send_attempts = 0;
-  bool failed = false;
-} HDLC;
 
 // util functions
 
@@ -219,82 +208,11 @@ void on_i2c_write_receive(int n) {
   }
 }
 
-
-#define HDLC_I_FRAME 0x00
-#define HDLC_S_FRAME 0x01
-#define HDLC_U_FRAME 0x03
-
-#define HDLC_S_TYPE_RR 0x00
-#define HDLC_S_TYPE_REJ 0x01
-
-#define HDLC_POLL 0x10
-#define HDLC_FINAL 0x00
-
 uint8_t next_seq_num = 0;
 
 uint8_t get_next_seq_num() {
   next_seq_num = (next_seq_num + 1) % 8;
   return next_seq_num;
-}
-
-uint8_t hdlc_get_frame_type(HDLC * hdlc) {
-  if((hdlc->control & 0x03) == 0x03) {
-    return HDLC_U_FRAME;
-  } else if((hdlc->control & 0x03) == 0x01) {
-    return HDLC_S_FRAME;
-  } else {
-    return HDLC_I_FRAME;
-  }
-}
-
-uint8_t hdlc_get_s_frame_type(HDLC * hdlc) {
-  return (hdlc->control >> 2) & 0x03;
-}
-
-uint8_t hdlc_get_s_frame_recv_seq(HDLC * hdlc) {
-  return (hdlc->control >> 5) & 0x07;
-}
-
-uint8_t hdlc_get_i_frame_recv_seq(HDLC * hdlc) {
-  return (hdlc->control >> 5) & 0x07;
-}
-
-uint8_t hdlc_get_i_frame_send_seq(HDLC * hdlc) {
-  return (hdlc->control >> 1) & 0x07;
-}
-
-void hdlc_new_ack_frame(HDLC * hdlc, uint8_t seq) {
-  hdlc->address = 0xFF;
-  // RECV SEQ | P/F | TYPE | S
-  hdlc->control = ((seq << 5) & 0xE0) | HDLC_FINAL | (HDLC_S_TYPE_RR << 2) | HDLC_S_FRAME;
-  hdlc->data_length = 0;
-  hdlc->ack = false;
-  hdlc->time_sent = 0;
-  hdlc->send_attempts = 0;
-  hdlc->do_retry = false;
-}
-
-void hdlc_new_nack_frame(HDLC * hdlc, uint8_t seq) {
-  hdlc->address = 0xFF;
-  // RECV SEQ | P/F | TYPE | S
-  hdlc->control = ((seq << 5) & 0xE0) | HDLC_FINAL | (HDLC_S_TYPE_REJ << 2) | HDLC_S_FRAME;
-  hdlc->data_length = 0;
-  hdlc->ack = false;
-  hdlc->time_sent = 0;
-  hdlc->send_attempts = 0;
-  hdlc->do_retry = false;
-}
-
-void hdlc_new_data_frame(HDLC * hdlc, uint8_t data[], uint8_t length) {
-  hdlc->address = 0xFF;
-  // RECV SEQ | P/F | SEND SEQ | I
-  hdlc->control = 0x00 | HDLC_POLL | ((get_next_seq_num() << 1) & 0x0E) | HDLC_I_FRAME;
-  hdlc->data_length = length;
-  memcpy(hdlc->data, data, length);
-  hdlc->ack = false;
-  hdlc->time_sent = 0;
-  hdlc->send_attempts = 0;
-  hdlc->do_retry = false;
 }
 
 void hdlc_send_data(HDLC * hdlc, CCPACKET * packet) {
@@ -323,7 +241,6 @@ void read_hdlc(CCPACKET * packet, HDLC * hdlc) {
   memcpy(hdlc->data, &(packet->data[2]), packet->length - 2);
   hdlc->data_length = packet->length - 2;
 }
-
 
 void setup() {
   radio.init();
@@ -381,6 +298,10 @@ void loop() {
         case HDLC_S_FRAME: {
           if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_S_TYPE_RR) {
             debug("Got ack frame");
+            uint8_t seq = hdlc_get_s_frame_recv_seq(&incomingFrame);
+            if(hdlc_get_i_frame_send_seq(&outgoingFrame) != seq) {
+              debug("Unexpected seq number!!");
+            }
             outgoingFrame.ack = true;
           } else if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_S_TYPE_REJ) {
             debug("Got nack frame");
@@ -424,7 +345,7 @@ void loop() {
     if(n > 0) {
       Serial.readBytes(serial_read_buffer, n);
       debug("sending one byte");
-      hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n);
+      hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n, get_next_seq_num());
       hdlc_send_data(&outgoingFrame, &packet);
     }
   }
