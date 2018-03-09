@@ -41,7 +41,24 @@ void messageReceived() {
 #define AX25_MAX_FRAME_LEN 330
 
 #define I2C_ADDRESS 0x04
-#define DEBUG false
+
+#define DEBUG true
+
+#if DEBUG
+#define PRINTS(s)   { Serial.print(F(s)); }
+#define PRINT(v)    { Serial.print(v); }
+#define PRINTLN(v)  { Serial.println(v); }
+#define PRINTLNS(s)  { Serial.println(F(s)); }
+#define PRINT2(s,v)  { Serial.print(F(s)); Serial.print(v); }
+#define PRINT3(s,v,b) { Serial.print(F(s)); Serial.print(v, b); }
+#else
+#define PRINTS(s)
+#define PRINT(v)
+#define PRINTLN(v)
+#define PRINTLNS(s)
+#define PRINT2(s,v)
+#define PRINT3(s,v,b)
+#endif
 
 // types
 typedef struct KISSCtx {
@@ -52,22 +69,6 @@ typedef struct KISSCtx {
     uint8_t hdlc_port = 0;
     uint8_t buffer[AX25_MAX_FRAME_LEN];
 } KISSCtx;
-
-// util functions
-
-void debug(const char * message) {
-  if(DEBUG) {
-    Serial.print("DEBUG: ");
-    Serial.println(message);
-  }
-}
-
-void debug(uint8_t message) {
-  if(DEBUG) {
-    Serial.print("DEBUG: ");
-    Serial.println(message);
-  }
-}
 
 // Get signal strength indicator in dBm.
 // See: http://www.ti.com/lit/an/swra114d/swra114d.pdf
@@ -182,7 +183,8 @@ void on_i2c_read_request() {
     //debug("Writing 0x0E to TNC");
     Wire.write(0x0E); // Tell the TNC we've got nothing
   } else {
-    debug("Writing data to TNC");
+    PRINTS("Writing data to TNC");
+
     uint8_t tmp[8];
     uint8_t i;
     for(i=0; i<min(i2c_output_buffer.size(), 8); i++) {
@@ -203,7 +205,7 @@ void on_i2c_write_receive(int n) {
     //Serial.println(byte, HEX);
     bool res = i2c_input_buffer.push(byte);
     if(!res) {
-      debug("!!!! Buffer overrun !!!!");
+      PRINTLN("!!!! Buffer overrun !!!!");
     }
   }
 }
@@ -220,6 +222,7 @@ void hdlc_send_data(HDLC * hdlc, CCPACKET * packet) {
   packet->data[1] = hdlc->control & 0xFF;
   memcpy(&(packet->data[2]), hdlc->data, hdlc->data_length);
   packet->length = hdlc->data_length + 2;
+  //delayMicroseconds(75); // settling time for other receiver
   detachInterrupt(CC1101Interrupt);
   radio.sendData(*packet);
   attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
@@ -229,10 +232,10 @@ void hdlc_send_data(HDLC * hdlc, CCPACKET * packet) {
   hdlc->ack = false;
 }
 
-void hdlc_send_ack(CCPACKET * packet) {
-  HDLC hdlc;
-  hdlc_new_ack_frame(&hdlc, 0); // TODO ack the sequence number
-  hdlc_send_data(&hdlc, packet);
+HDLC supervisory;
+void hdlc_send_ack(CCPACKET * packet, uint8_t seq) {
+  hdlc_new_ack_frame(&supervisory, seq);
+  hdlc_send_data(&supervisory, packet);
 }
 
 void read_hdlc(CCPACKET * packet, HDLC * hdlc) {
@@ -242,12 +245,28 @@ void read_hdlc(CCPACKET * packet, HDLC * hdlc) {
   hdlc->data_length = packet->length - 2;
 }
 
+void debug_state(char * msg) {
+  PRINT("=================="); PRINT(msg); PRINTLN("==================");
+  PRINT2("packetWaiting: ",packetWaiting); PRINTLN("");
+
+  PRINT2("incomingFrame#ack: ", incomingFrame.ack); PRINTLN("");
+  PRINT2("incomingFrame#time_sent: ", incomingFrame.time_sent); PRINTLN("");
+  PRINT2("incomingFrame#send_attempts: ", incomingFrame.send_attempts); PRINTLN("");
+  PRINT2("incomingFrame#do_retry: ", incomingFrame.do_retry); PRINTLN("");
+
+  PRINT2("outgoingFrame#ack: ", outgoingFrame.ack); PRINTLN("");
+  PRINT2("outgoingFrame#time_sent: ", outgoingFrame.time_sent); PRINTLN("");
+  PRINT2("outgoingFrame#send_attempts: ", outgoingFrame.send_attempts); PRINTLN("");
+  PRINT2("outgoingFrame#do_retry: ", outgoingFrame.do_retry); PRINTLN("");
+
+}
+
 void setup() {
   radio.init();
   radio.setSyncWord(syncWord);
   radio.setCarrierFreq(CFREQ_433);
   radio.disableAddressCheck();
-  radio.setTxPowerAmp(PA_LongDistance);
+  radio.setTxPowerAmp(PA_LowPower);
   attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
 
   Wire.begin(I2C_ADDRESS);
@@ -255,20 +274,111 @@ void setup() {
   Wire.onReceive(on_i2c_write_receive);
 
   Serial.begin(9600);
-  debug("CC1101_PARTNUM ");
-  debug(radio.readReg(CC1101_PARTNUM, CC1101_STATUS_REGISTER));
-  debug("CC1101_VERSION ");
-  debug(radio.readReg(CC1101_VERSION, CC1101_STATUS_REGISTER));
-  debug("CC1101_MARCSTATE ");
-  debug(radio.readReg(CC1101_MARCSTATE, CC1101_STATUS_REGISTER) & 0x1f);
+  PRINTLN("CC1101_PARTNUM ");
+  PRINTLN(radio.readReg(CC1101_PARTNUM, CC1101_STATUS_REGISTER));
+  PRINTLN("CC1101_VERSION ");
+  PRINTLN(radio.readReg(CC1101_VERSION, CC1101_STATUS_REGISTER));
+  PRINTLN("CC1101_MARCSTATE ");
+  PRINTLN(radio.readReg(CC1101_MARCSTATE, CC1101_STATUS_REGISTER) & 0x1f);
 
-  debug("CC1101 radio initialized.");
-  debug("TNC Begin");
+  PRINTLN("CC1101 radio initialized.");
+  PRINTLN("Begin!");
 }
 
-uint8_t serial_read_buffer[64];
+uint8_t serial_read_buffer[48];
+
+#define TX_COUNTDOWN_MS 50
+
+unsigned long last_tx = 0;
+
+CircularBuffer<uint8_t, 8> ack_queue;
 
 void loop() {
+  bool newFrame = false;
+  // Check incoming packet
+  if(packetWaiting) {
+    detachInterrupt(CC1101Interrupt);
+    packetWaiting = false;
+    if (radio.receiveData(&packet) > 0) {
+      if (packet.crc_ok && packet.length > 0) {
+        read_hdlc(&packet, &incomingFrame);
+        newFrame = true;
+      }
+    }
+    attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
+  }
+
+  // Handle new HDLC frame
+  if(newFrame) {
+    switch(hdlc_get_frame_type(&incomingFrame)) {
+      case HDLC_I_FRAME: { // Information (data) frame
+        uint8_t seq = hdlc_get_i_frame_send_seq(&incomingFrame);
+
+        // Buffer output
+        for(uint8_t i=0; i<incomingFrame.data_length; i++) {
+          bool res = i2c_output_buffer.push(incomingFrame.data[i]);
+          if(!res) {
+            PRINTLN("!!! Output Buffer Overrun !!!");
+            break;
+          }
+        }
+
+        // Buffer ACK
+        ack_queue.push(seq);
+      } break;
+      case HDLC_S_FRAME: { // Supervisory frame
+        uint8_t recv_seq = hdlc_get_s_frame_recv_seq(&incomingFrame);
+        if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_S_TYPE_RR) {
+          uint8_t sent_seq = hdlc_get_i_frame_send_seq(&outgoingFrame);
+          if(sent_seq != recv_seq) {
+            // TODO what to do here?
+          }
+        }
+      } break;
+      case HDLC_U_FRAME: {
+      } break;
+      default:
+        break;
+    }
+  }
+
+  // Check incoming serial data
+  while (Serial.available() && i2c_input_buffer.available() > 0) {
+    uint8_t byte = Serial.read();
+    bool res = i2c_input_buffer.push(byte);
+    if(!res) {
+      // Shouldn't happen
+      PRINTLN("!!!! Input Buffer Overrun !!!!");
+      break;
+    }
+  }
+
+  // Decide if we need to TX
+  unsigned long now = millis();
+  if(now - last_tx > TX_COUNTDOWN_MS) {
+    if(ack_queue.size() > 0) {
+      hdlc_send_ack(&packet, ack_queue.shift());
+      last_tx = now;
+    } else if(i2c_input_buffer.size() > 0) {
+      uint8_t n = min(i2c_input_buffer.size(), 48);
+      if(n > 0) {
+        for(uint8_t i=0; i<n; i++) {
+          serial_read_buffer[i] = i2c_input_buffer.shift();
+        }
+        hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n, get_next_seq_num());
+        hdlc_send_data(&outgoingFrame, &packet);
+        last_tx = now;
+      }
+    }
+  }
+
+  // Output Serial, if any
+  while(i2c_output_buffer.size() > 0) {
+    Serial.write(i2c_output_buffer.shift());
+  }
+}
+
+void loop2() {
   // Check for incoming packet and copy it to a frame
   if (packetWaiting) {
     detachInterrupt(CC1101Interrupt);
@@ -276,7 +386,8 @@ void loop() {
     bool gotPacket = false;
     if (radio.receiveData(&packet) > 0) {
       if (packet.crc_ok && packet.length > 0) {
-        debug("Got packet");
+        //PRINT2("Got packet with ", packet.length);
+        //PRINTLN(" bytes");
         read_hdlc(&packet, &incomingFrame);
         gotPacket = true;
       }
@@ -288,70 +399,113 @@ void loop() {
       switch(hdlc_get_frame_type(&incomingFrame)) {
         case HDLC_I_FRAME: {
           // incoming data frame
-          debug("Got data frame, sending ack");
-          //for(uint8_t i=0; i<incomingFrame.data_length; i++) {
-          //  rf_input_buffer.push(incomingFrame.data[i]);
-          //}
+          uint8_t seq = hdlc_get_i_frame_send_seq(&incomingFrame);
+          PRINT2("RECV_DATA[", seq);
+          PRINTLN("]");
+          //debug_state("RECV_DATA");
+
           Serial.write(incomingFrame.data, incomingFrame.data_length);
-          hdlc_send_ack(&packet);
+          delay(500);
+          hdlc_send_ack(&packet, seq);
+          PRINT2("SEND_ACK[", seq);
+          PRINTLN("]");
+          //debug_state("SEND_ACK");
         } break;
         case HDLC_S_FRAME: {
+          uint8_t recv_seq = hdlc_get_s_frame_recv_seq(&incomingFrame);
           if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_S_TYPE_RR) {
-            debug("Got ack frame");
-            uint8_t seq = hdlc_get_s_frame_recv_seq(&incomingFrame);
-            if(hdlc_get_i_frame_send_seq(&outgoingFrame) != seq) {
-              debug("Unexpected seq number!!");
+            PRINT2("RECV_ACK[", recv_seq);
+            PRINTLN("]");
+            //debug_state("RECV_ACK");
+            uint8_t sent_seq = hdlc_get_i_frame_send_seq(&outgoingFrame);
+            if(sent_seq != recv_seq) {
+              // TODO what to do here?
+              PRINT2("Unexpected seq number, expected ", sent_seq);
+              PRINT2(" got ", recv_seq);
+              PRINTLN("");
             }
             outgoingFrame.ack = true;
           } else if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_S_TYPE_REJ) {
-            debug("Got nack frame");
+            PRINT2("RECV_NACK[", recv_seq);
+            PRINTLN("]");
             outgoingFrame.ack = false;
             outgoingFrame.do_retry = true;
           }
         } break;
         case HDLC_U_FRAME: {
-          // unsupported
+          PRINTLN("Unexpected U frame received, ignoring");
         } break;
-        default: break;
+        default:
+          break;
       }
+    }
+  }
+
+  // Check Serial for more data
+  while (Serial.available() && i2c_input_buffer.available() > 0) {
+    uint8_t byte = Serial.read();
+    bool res = i2c_input_buffer.push(byte);
+    if(!res) {
+      PRINTLN("!!!! Buffer overrun !!!!");
     }
   }
 
   // Check if we're waiting on an ACK message
   if(outgoingFrame.ack == false) {
-    if(millis() - outgoingFrame.time_sent > 100) { // timeout
-      debug("ack timeout");
+    if(millis() - outgoingFrame.time_sent > (2000 + outgoingFrame.send_attempts * 20)) { // timeout
       outgoingFrame.do_retry = true;
     }
 
     // Check if we need to resend last frame
     if(outgoingFrame.do_retry == true) {
-      if(outgoingFrame.send_attempts > 3) { // too many retries
-        debug("too many retries");
+      if(outgoingFrame.send_attempts > 7) { // too many retries
+        PRINT2("DROP[", hdlc_get_i_frame_send_seq(&outgoingFrame));
+        PRINTLN("]");
+        //debug_state("drop");
         outgoingFrame.do_retry = false;
         outgoingFrame.failed = true;
         outgoingFrame.ack = true;
       } else {
-        debug("retrying");
+        PRINT2("RESEND[", hdlc_get_i_frame_send_seq(&outgoingFrame));
+        PRINTLN("]");
+        //debug_state("resend");
         hdlc_send_data(&outgoingFrame, &packet);
       }
     } else {
       // still waiting for ACK, loop
-      delay(0);
+      //delay(1);
     }
   } else {
     // last frame is ACK'd we're ready to send next byte
-    uint8_t n = min(Serial.available(), 64);
+
+
+    // Send data if we have any waiting
+    uint8_t n = min(i2c_input_buffer.size(), 48);
     if(n > 0) {
-      Serial.readBytes(serial_read_buffer, n);
-      debug("sending one byte");
-      hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n, get_next_seq_num());
+      for(uint8_t i=0; i<n; i++) {
+        serial_read_buffer[i] = i2c_input_buffer.shift();
+      }
+      uint8_t seq = get_next_seq_num();
+      PRINT2("SEND[", seq);
+      PRINTLN("]");
+      hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n, seq);
       hdlc_send_data(&outgoingFrame, &packet);
     }
+    /*
+    if(n > 0) {
+      i2c_input_buffer
+      Serial.readBytes(serial_read_buffer, n);
+      uint8_t seq = get_next_seq_num();
+      PRINT2("SEND[", seq);
+      PRINTLN("]");
+      //debug_state("send");
+      hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n, seq);
+      hdlc_send_data(&outgoingFrame, &packet);
+    } else {
+      // not waiting for anything, but no data ready to send, loop
+      //delay(1);
+    }
+    */
   }
 
-  //while(rf_input_buffer.size() > 0) {
-  //  Serial.print(": ");
-  //  Serial.println((char)rf_input_buffer.pop());
-  //}
 }
