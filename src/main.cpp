@@ -60,6 +60,8 @@ void messageReceived() {
 #define PRINT3(s,v,b)
 #endif
 
+#define EXP_BACKOFF(a,b,x) (a + b * (2^x))
+
 // types
 typedef struct KISSCtx {
     size_t frame_len = 0;
@@ -287,7 +289,7 @@ void setup() {
 
 uint8_t serial_read_buffer[48];
 
-#define TX_COUNTDOWN_MS 50
+#define TX_COUNTDOWN_MS 20
 
 unsigned long last_tx = 0;
 
@@ -295,6 +297,7 @@ CircularBuffer<uint8_t, 8> ack_queue;
 
 void loop() {
   bool newFrame = false;
+
   // Check incoming packet
   if(packetWaiting) {
     detachInterrupt(CC1101Interrupt);
@@ -327,12 +330,11 @@ void loop() {
         ack_queue.push(seq);
       } break;
       case HDLC_S_FRAME: { // Supervisory frame
-        uint8_t recv_seq = hdlc_get_s_frame_recv_seq(&incomingFrame);
+        // TODO check seq num for RR and REJ
+        //uint8_t recv_seq = hdlc_get_s_frame_recv_seq(&incomingFrame);
         if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_S_TYPE_RR) {
-          uint8_t sent_seq = hdlc_get_i_frame_send_seq(&outgoingFrame);
-          if(sent_seq != recv_seq) {
-            // TODO what to do here?
-          }
+          //uint8_t sent_seq = hdlc_get_i_frame_send_seq(&outgoingFrame);
+          outgoingFrame.ack = true;
         }
       } break;
       case HDLC_U_FRAME: {
@@ -359,15 +361,46 @@ void loop() {
     if(ack_queue.size() > 0) {
       hdlc_send_ack(&packet, ack_queue.shift());
       last_tx = now;
-    } else if(i2c_input_buffer.size() > 0) {
-      uint8_t n = min(i2c_input_buffer.size(), 48);
-      if(n > 0) {
-        for(uint8_t i=0; i<n; i++) {
-          serial_read_buffer[i] = i2c_input_buffer.shift();
+    } else {
+      // Check ACK timeout
+      if(outgoingFrame.ack == false) {
+        if(now - outgoingFrame.time_sent > EXP_BACKOFF(100, 50, outgoingFrame.send_attempts) ) { // timeout
+          PRINTLN("ack timeout");
         }
-        hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n, get_next_seq_num());
-        hdlc_send_data(&outgoingFrame, &packet);
-        last_tx = now;
+
+        /*
+        // Check if we need to resend last frame
+        if(outgoingFrame.do_retry == true) {
+          if(outgoingFrame.send_attempts > 7) { // too many retries
+            PRINT2("DROP[", hdlc_get_i_frame_send_seq(&outgoingFrame));
+            PRINTLN("]");
+            //debug_state("drop");
+            outgoingFrame.do_retry = false;
+            outgoingFrame.failed = true;
+            outgoingFrame.ack = true;
+          } else {
+            PRINT2("RESEND[", hdlc_get_i_frame_send_seq(&outgoingFrame));
+            PRINTLN("]");
+            //debug_state("resend");
+            hdlc_send_data(&outgoingFrame, &packet);
+          }
+        } else {
+          // still waiting for ACK, loop
+          //delay(1);
+        }
+        */
+      }
+
+      if(i2c_input_buffer.size() > 0) {
+        uint8_t n = min(i2c_input_buffer.size(), 48);
+        if(n > 0) {
+          for(uint8_t i=0; i<n; i++) {
+            serial_read_buffer[i] = i2c_input_buffer.shift();
+          }
+          hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n, get_next_seq_num());
+          hdlc_send_data(&outgoingFrame, &packet);
+          last_tx = now;
+        }
       }
     }
   }
@@ -376,136 +409,4 @@ void loop() {
   while(i2c_output_buffer.size() > 0) {
     Serial.write(i2c_output_buffer.shift());
   }
-}
-
-void loop2() {
-  // Check for incoming packet and copy it to a frame
-  if (packetWaiting) {
-    detachInterrupt(CC1101Interrupt);
-    packetWaiting = false;
-    bool gotPacket = false;
-    if (radio.receiveData(&packet) > 0) {
-      if (packet.crc_ok && packet.length > 0) {
-        //PRINT2("Got packet with ", packet.length);
-        //PRINTLN(" bytes");
-        read_hdlc(&packet, &incomingFrame);
-        gotPacket = true;
-      }
-    }
-    attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
-
-    // Handle the incoming frame
-    if(gotPacket) {
-      switch(hdlc_get_frame_type(&incomingFrame)) {
-        case HDLC_I_FRAME: {
-          // incoming data frame
-          uint8_t seq = hdlc_get_i_frame_send_seq(&incomingFrame);
-          PRINT2("RECV_DATA[", seq);
-          PRINTLN("]");
-          //debug_state("RECV_DATA");
-
-          Serial.write(incomingFrame.data, incomingFrame.data_length);
-          delay(500);
-          hdlc_send_ack(&packet, seq);
-          PRINT2("SEND_ACK[", seq);
-          PRINTLN("]");
-          //debug_state("SEND_ACK");
-        } break;
-        case HDLC_S_FRAME: {
-          uint8_t recv_seq = hdlc_get_s_frame_recv_seq(&incomingFrame);
-          if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_S_TYPE_RR) {
-            PRINT2("RECV_ACK[", recv_seq);
-            PRINTLN("]");
-            //debug_state("RECV_ACK");
-            uint8_t sent_seq = hdlc_get_i_frame_send_seq(&outgoingFrame);
-            if(sent_seq != recv_seq) {
-              // TODO what to do here?
-              PRINT2("Unexpected seq number, expected ", sent_seq);
-              PRINT2(" got ", recv_seq);
-              PRINTLN("");
-            }
-            outgoingFrame.ack = true;
-          } else if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_S_TYPE_REJ) {
-            PRINT2("RECV_NACK[", recv_seq);
-            PRINTLN("]");
-            outgoingFrame.ack = false;
-            outgoingFrame.do_retry = true;
-          }
-        } break;
-        case HDLC_U_FRAME: {
-          PRINTLN("Unexpected U frame received, ignoring");
-        } break;
-        default:
-          break;
-      }
-    }
-  }
-
-  // Check Serial for more data
-  while (Serial.available() && i2c_input_buffer.available() > 0) {
-    uint8_t byte = Serial.read();
-    bool res = i2c_input_buffer.push(byte);
-    if(!res) {
-      PRINTLN("!!!! Buffer overrun !!!!");
-    }
-  }
-
-  // Check if we're waiting on an ACK message
-  if(outgoingFrame.ack == false) {
-    if(millis() - outgoingFrame.time_sent > (2000 + outgoingFrame.send_attempts * 20)) { // timeout
-      outgoingFrame.do_retry = true;
-    }
-
-    // Check if we need to resend last frame
-    if(outgoingFrame.do_retry == true) {
-      if(outgoingFrame.send_attempts > 7) { // too many retries
-        PRINT2("DROP[", hdlc_get_i_frame_send_seq(&outgoingFrame));
-        PRINTLN("]");
-        //debug_state("drop");
-        outgoingFrame.do_retry = false;
-        outgoingFrame.failed = true;
-        outgoingFrame.ack = true;
-      } else {
-        PRINT2("RESEND[", hdlc_get_i_frame_send_seq(&outgoingFrame));
-        PRINTLN("]");
-        //debug_state("resend");
-        hdlc_send_data(&outgoingFrame, &packet);
-      }
-    } else {
-      // still waiting for ACK, loop
-      //delay(1);
-    }
-  } else {
-    // last frame is ACK'd we're ready to send next byte
-
-
-    // Send data if we have any waiting
-    uint8_t n = min(i2c_input_buffer.size(), 48);
-    if(n > 0) {
-      for(uint8_t i=0; i<n; i++) {
-        serial_read_buffer[i] = i2c_input_buffer.shift();
-      }
-      uint8_t seq = get_next_seq_num();
-      PRINT2("SEND[", seq);
-      PRINTLN("]");
-      hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n, seq);
-      hdlc_send_data(&outgoingFrame, &packet);
-    }
-    /*
-    if(n > 0) {
-      i2c_input_buffer
-      Serial.readBytes(serial_read_buffer, n);
-      uint8_t seq = get_next_seq_num();
-      PRINT2("SEND[", seq);
-      PRINTLN("]");
-      //debug_state("send");
-      hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n, seq);
-      hdlc_send_data(&outgoingFrame, &packet);
-    } else {
-      // not waiting for anything, but no data ready to send, loop
-      //delay(1);
-    }
-    */
-  }
-
 }
