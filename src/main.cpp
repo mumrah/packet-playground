@@ -231,7 +231,7 @@ void hdlc_send_data(HDLC * hdlc, CCPACKET * packet) {
   hdlc->send_attempts += 1;
   hdlc->time_sent = millis();
   hdlc->do_retry = false;
-  hdlc->ack = false;
+  // don't set ACK here
 }
 
 HDLC supervisory;
@@ -290,6 +290,7 @@ void setup() {
 uint8_t serial_read_buffer[48];
 
 #define TX_COUNTDOWN_MS 20
+#define HDLC_MODE HDLC_MODE_BEST_EFFORT
 
 unsigned long last_tx = 0;
 
@@ -338,6 +339,15 @@ void loop() {
         }
       } break;
       case HDLC_U_FRAME: {
+        if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_U_TYPE_UI) {
+          for(uint8_t i=0; i<incomingFrame.data_length; i++) {
+            bool res = i2c_output_buffer.push(incomingFrame.data[i]);
+            if(!res) {
+              PRINTLN("!!! Output Buffer Overrun !!!");
+              break;
+            }
+          }
+        }
       } break;
       default:
         break;
@@ -364,31 +374,23 @@ void loop() {
     } else {
       // Check ACK timeout
       if(outgoingFrame.ack == false) {
-        if(now - outgoingFrame.time_sent > EXP_BACKOFF(100, 50, outgoingFrame.send_attempts) ) { // timeout
-          PRINTLN("ack timeout");
+        if(now - outgoingFrame.time_sent > EXP_BACKOFF(100, 50, outgoingFrame.send_attempts) ) {
+          outgoingFrame.do_retry = true;
         }
 
-        /*
-        // Check if we need to resend last frame
         if(outgoingFrame.do_retry == true) {
           if(outgoingFrame.send_attempts > 7) { // too many retries
-            PRINT2("DROP[", hdlc_get_i_frame_send_seq(&outgoingFrame));
-            PRINTLN("]");
-            //debug_state("drop");
+            PRINTLN("drop");
             outgoingFrame.do_retry = false;
             outgoingFrame.failed = true;
             outgoingFrame.ack = true;
           } else {
-            PRINT2("RESEND[", hdlc_get_i_frame_send_seq(&outgoingFrame));
-            PRINTLN("]");
-            //debug_state("resend");
-            hdlc_send_data(&outgoingFrame, &packet);
+            PRINTLN("resend");
+            outgoingFrame.do_retry = false;
+            outgoingFrame.send_attempts += 1; // fake it for now
+            //hdlc_send_data(&outgoingFrame, &packet);
           }
-        } else {
-          // still waiting for ACK, loop
-          //delay(1);
         }
-        */
       }
 
       if(i2c_input_buffer.size() > 0) {
@@ -397,7 +399,11 @@ void loop() {
           for(uint8_t i=0; i<n; i++) {
             serial_read_buffer[i] = i2c_input_buffer.shift();
           }
+          #if HDLC_MODE == HDLC_MODE_BEST_EFFORT
+          hdlc_new_ui_frame(&outgoingFrame, serial_read_buffer, n);
+          #elif HDLC_MODE == HDLC_MODE_RELIABLE
           hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n, get_next_seq_num());
+          #endif
           hdlc_send_data(&outgoingFrame, &packet);
           last_tx = now;
         }
