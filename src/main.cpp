@@ -6,6 +6,7 @@
 
 #include "ax25.h"
 #include "HDLC.h"
+#include "KISS.h"
 
 #define CC1101Interrupt 0 // Pin 2
 #define CC1101_GDO0 2
@@ -13,36 +14,10 @@
 CC1101 radio;
 
 byte syncWord[2] = {199, 10};
-bool packetWaiting;
-
-unsigned long lastSend = 0;
-unsigned int sendDelay = 5000;
-
-void messageReceived() {
-    packetWaiting = true;
-}
-
-#define FEND 0xC0
-#define FESC 0xDB
-#define TFEND 0xDC
-#define TFESC 0xDD
-
-// KISS commands
-#define CMD_UNKNOWN 0xFE
-#define CMD_DATA 0x00
-#define CMD_TXDELAY 0x01
-#define CMD_P 0x02
-#define CMD_SLOTTIME 0x03
-#define CMD_TXTAIL 0x04
-#define CMD_FULLDUPLEX 0x05
-#define CMD_SETHARDWARE 0x06
-#define CMD_RETURN 0xFF
-
-#define AX25_MAX_FRAME_LEN 330
 
 #define I2C_ADDRESS 0x04
 
-#define DEBUG true
+#define DEBUG false
 
 #if DEBUG
 #define PRINTS(s)   { Serial.print(F(s)); }
@@ -61,16 +36,6 @@ void messageReceived() {
 #endif
 
 #define EXP_BACKOFF(a,b,x) (a + b * (2^x))
-
-// types
-typedef struct KISSCtx {
-    size_t frame_len = 0;
-    bool in_escape = false;
-    bool in_frame = false;
-    uint8_t command = CMD_UNKNOWN;
-    uint8_t hdlc_port = 0;
-    uint8_t buffer[AX25_MAX_FRAME_LEN];
-} KISSCtx;
 
 // Get signal strength indicator in dBm.
 // See: http://www.ti.com/lit/an/swra114d/swra114d.pdf
@@ -93,87 +58,23 @@ int lqi(char raw) {
 // globals
 CircularBuffer<uint8_t, 400> i2c_input_buffer;
 CircularBuffer<uint8_t, 100> i2c_output_buffer;
+CircularBuffer<uint8_t, 8> ack_queue;
 
 KISSCtx kissCtx;
-AX25Call dst;
-AX25Call src;
-
 HDLC incomingFrame;
 HDLC outgoingFrame;
 CCPACKET packet;
 
-/*
- * Called once we've decoded an entire packet from a KISS frame
- */
-void on_ax25_packet(uint8_t buffer[], size_t len) {
-  detachInterrupt(CC1101Interrupt);
-  CCPACKET packet;
-  for(uint8_t i=0; i<len; i+=20) {
-    size_t n = min(20, len-i);
-    memset((char *)packet.data, '\0', 64);
-    memcpy((char *)packet.data, buffer + i, n);
-    packet.length = n + 1;
-    radio.sendData(packet);
-    delay(100);
-  }
-  attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
-}
+#define TX_COUNTDOWN_MS 20
+#define HDLC_MODE HDLC_MODE_BEST_EFFORT
 
-/*
- * Called as each byte of a KISS frame is received over i2c. Bytes are buffered
- * in the global KISSCtx buffer which has enough room for the max length AX25
- * frame (330 bytes).
- */
-void poll_kiss(uint8_t b, KISSCtx *kiss) {
-  if (kiss->in_frame && b == FEND && kiss->command == CMD_DATA) {
-    // end of a data frame
-    kiss->in_frame = false;
-    on_ax25_packet(kiss->buffer, kiss->frame_len);
-  } else if (b == FEND) {
-    // beginning of data frmae
-    kiss->in_frame = true;
-    kiss->command = CMD_UNKNOWN;
-    kiss->frame_len = 0;
-  } else if (kiss->in_frame && kiss->frame_len < AX25_MAX_FRAME_LEN) {
-    // in a frame, check for commands first
-    if (kiss->frame_len == 0 && kiss->command == CMD_UNKNOWN) {
-      kiss->hdlc_port = b & 0xF0; // multiple HDLC ports are supported by KISS, apparently
-      kiss->command = b & 0x0F;
-    } else if (kiss->command == CMD_DATA) {
-      if (b == FESC) {
-        kiss->in_escape = true;
-      } else {
-        if (kiss->in_escape) {
-          if (b == TFEND) b = FEND;
-          if (b == TFESC) b = FESC;
-          kiss->in_escape = false;
-        }
-        kiss->buffer[kiss->frame_len++] = b;
-      }
-    } // TODO implement other commands
-  }
-}
+unsigned long last_tx = 0;
+uint8_t tx_packet_buffer[48];
 
-/**
- * Given a buffer and its length, write the buffer out over Serial encoded
- * with KISS framing
- */
-void serial_kiss_wrapper(uint8_t buffer[], size_t len) {
-  Serial.write(FEND);
-  Serial.write(0x00);
-  for (unsigned i = 0; i < len; i++) {
-    uint8_t b = buffer[i];
-    if (b == FEND) {
-      Serial.write(FESC);
-      Serial.write(TFEND);
-    } else if (b == FESC) {
-      Serial.write(FESC);
-      Serial.write(TFESC);
-    } else {
-      Serial.write(b);
-    }
-  }
-  Serial.write(FEND);
+bool packetWaiting;
+
+void messageReceived() {
+    packetWaiting = true;
 }
 
 /*
@@ -182,7 +83,6 @@ void serial_kiss_wrapper(uint8_t buffer[], size_t len) {
  */
 void on_i2c_read_request() {
   if(i2c_output_buffer.isEmpty()) {
-    //debug("Writing 0x0E to TNC");
     Wire.write(0x0E); // Tell the TNC we've got nothing
   } else {
     PRINTS("Writing data to TNC");
@@ -201,22 +101,13 @@ void on_i2c_read_request() {
  * buffer as we can into our own input buffer
  */
 void on_i2c_write_receive(int n) {
-  //debug("on_i2c_write_receive");
   while (Wire.available() && i2c_input_buffer.available() > 0) {
     uint8_t byte = Wire.read();
-    //Serial.println(byte, HEX);
     bool res = i2c_input_buffer.push(byte);
     if(!res) {
       PRINTLN("!!!! Buffer overrun !!!!");
     }
   }
-}
-
-uint8_t next_seq_num = 0;
-
-uint8_t get_next_seq_num() {
-  next_seq_num = (next_seq_num + 1) % 8;
-  return next_seq_num;
 }
 
 void hdlc_send_data(HDLC * hdlc, CCPACKET * packet) {
@@ -247,6 +138,19 @@ void read_hdlc(CCPACKET * packet, HDLC * hdlc) {
   hdlc->data_length = packet->length - 2;
 }
 
+/**
+ * Here we have recieved a packet from the radio
+ */
+void on_rf_packet(uint8_t * data, uint8_t len) {
+  for(uint8_t i=0; i<incomingFrame.data_length; i++) {
+    bool res = i2c_output_buffer.push(incomingFrame.data[i]);
+    if(!res) {
+      PRINTLN("!!! Output Buffer Overrun !!!");
+      break;
+    }
+  }
+}
+
 void debug_state(char * msg) {
   PRINT("=================="); PRINT(msg); PRINTLN("==================");
   PRINT2("packetWaiting: ",packetWaiting); PRINTLN("");
@@ -269,6 +173,11 @@ void setup() {
   radio.setCarrierFreq(CFREQ_433);
   radio.disableAddressCheck();
   radio.setTxPowerAmp(PA_LowPower);
+  //radio.writeReg(CC1101_MDMCFG2, 0x03);
+  //radio.writeReg(CC1101_MDMCFG3, 0x83);
+  //radio.writeReg(CC1101_MDMCFG4, 0xF5);
+  //radio.writeReg(CC1101_DEVIATN, 0x40);
+
   attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
 
   Wire.begin(I2C_ADDRESS);
@@ -286,15 +195,6 @@ void setup() {
   PRINTLN("CC1101 radio initialized.");
   PRINTLN("Begin!");
 }
-
-uint8_t serial_read_buffer[48];
-
-#define TX_COUNTDOWN_MS 20
-#define HDLC_MODE HDLC_MODE_BEST_EFFORT
-
-unsigned long last_tx = 0;
-
-CircularBuffer<uint8_t, 8> ack_queue;
 
 void loop() {
   bool newFrame = false;
@@ -316,19 +216,11 @@ void loop() {
   if(newFrame) {
     switch(hdlc_get_frame_type(&incomingFrame)) {
       case HDLC_I_FRAME: { // Information (data) frame
-        uint8_t seq = hdlc_get_i_frame_send_seq(&incomingFrame);
-
-        // Buffer output
-        for(uint8_t i=0; i<incomingFrame.data_length; i++) {
-          bool res = i2c_output_buffer.push(incomingFrame.data[i]);
-          if(!res) {
-            PRINTLN("!!! Output Buffer Overrun !!!");
-            break;
-          }
-        }
-
         // Buffer ACK
+        uint8_t seq = hdlc_get_i_frame_send_seq(&incomingFrame);
         ack_queue.push(seq);
+        // Run callback
+        on_rf_packet(incomingFrame.data, incomingFrame.data_length);
       } break;
       case HDLC_S_FRAME: { // Supervisory frame
         // TODO check seq num for RR and REJ
@@ -340,13 +232,7 @@ void loop() {
       } break;
       case HDLC_U_FRAME: {
         if(hdlc_get_s_frame_type(&incomingFrame) == HDLC_U_TYPE_UI) {
-          for(uint8_t i=0; i<incomingFrame.data_length; i++) {
-            bool res = i2c_output_buffer.push(incomingFrame.data[i]);
-            if(!res) {
-              PRINTLN("!!! Output Buffer Overrun !!!");
-              break;
-            }
-          }
+          on_rf_packet(incomingFrame.data, incomingFrame.data_length);
         }
       } break;
       default:
@@ -397,12 +283,12 @@ void loop() {
         uint8_t n = min(i2c_input_buffer.size(), 48);
         if(n > 0) {
           for(uint8_t i=0; i<n; i++) {
-            serial_read_buffer[i] = i2c_input_buffer.shift();
+            tx_packet_buffer[i] = i2c_input_buffer.shift();
           }
           #if HDLC_MODE == HDLC_MODE_BEST_EFFORT
-          hdlc_new_ui_frame(&outgoingFrame, serial_read_buffer, n);
+          hdlc_new_ui_frame(&outgoingFrame, tx_packet_buffer, n);
           #elif HDLC_MODE == HDLC_MODE_RELIABLE
-          hdlc_new_data_frame(&outgoingFrame, serial_read_buffer, n, get_next_seq_num());
+          hdlc_new_data_frame(&outgoingFrame, tx_packet_buffer, n);
           #endif
           hdlc_send_data(&outgoingFrame, &packet);
           last_tx = now;

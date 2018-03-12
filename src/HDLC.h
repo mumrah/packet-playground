@@ -86,7 +86,15 @@ void hdlc_new_nack_frame(HDLC * hdlc, uint8_t seq) {
   hdlc->do_retry = false;
 }
 
-void hdlc_new_data_frame(HDLC * hdlc, uint8_t data[], uint8_t length, uint8_t seq) {
+uint8_t next_seq_num = 0;
+
+uint8_t hdlc_next_seq() {
+  next_seq_num = (next_seq_num + 1) % 8;
+  return next_seq_num;
+}
+
+void hdlc_new_data_frame(HDLC * hdlc, uint8_t data[], uint8_t length) {
+  uint8_t seq = hdlc_next_seq();
   hdlc->address = 0xFF;
   // type upper | P/F | type lower | 1 1
   hdlc->control = 0x00 | HDLC_FINAL | ((seq << 1) & 0x0E) | HDLC_I_FRAME;
