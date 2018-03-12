@@ -16,6 +16,13 @@ The eventual desired flow is:
 Using KISS framing we can talk to desktop applications like XASTIR, ARPX, YAAC,
 or anything capable of supporting AX25 packets encoded with KISS
 
+## HDLC Framing
+
+Some basic flow control is implementing following HDLC protocol. In "reliable" mode
+every packet is sent as an I frame and must be acknowledged by the receiver before 
+the transmitter sends the next packet. In "best effort" mode, data is sent as UI 
+frames which are unacknowledged.
+
 ## CC1101 RF
 
 Using this [CC1101 library](https://github.com/veonik/arduino-cc1101/),
